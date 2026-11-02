@@ -2,7 +2,7 @@
 
 A lightweight, event-driven screenshot watchdog that bridges [Niri](https://github.com/YaLTeR/niri) compositor screenshot events to [Satty](https://github.com/gabm/Satty) for instant annotation.
 
-> **Note on repository naming:** This project replaces the legacy KDE Spectacle daemon workflow on Niri (hence the workspace directory name `niri-spectacle-daemon`) with a dedicated native Rust daemon (`niri-screenshot-daemon`) driving Satty.
+> **Note on repository naming:** This project replaces my legacy KDE Spectacle daemon workflow onto Niri (hence the workspace directory name `niri-spectacle-daemon`) with a dedicated native Rust daemon (`niri-screenshot-daemon`) driving Satty.
 
 ---
 
