@@ -1,0 +1,8 @@
+/target
+/niri-screenshot-daemon/target
+**/*.rs.bk
+*.swp
+*.bak
+*~
+.DS_Store
+

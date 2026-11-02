@@ -1,0 +1,24 @@
+# Example configuration for niri-screenshot-daemon
+# Place this at ~/.config/niri-screenshot-daemon/config.toml
+# or pass it via --config /path/to/config.toml
+
+# Extra socket paths or directories to monitor on startup.
+# - If a path is a directory, it will be scanned for `niri*.sock`.
+# - If a path is a direct socket file, it will be monitored directly.
+extra_sockets = [
+    # "/run/user/1001",
+    # "/tmp/nested-runtime/niri-0.sock",
+]
+
+# Control socket path for IPC communication between nested sessions and host daemon
+# Defaults to /run/user/<uid>/niri-screenshot-daemon.sock
+# control_socket = "/run/user/1000/niri-screenshot-daemon.sock"
+
+# Optional host display & runtime overrides (defaults to $WAYLAND_DISPLAY and $XDG_RUNTIME_DIR)
+# host_wayland = "wayland-0"
+# host_runtime = "/run/user/1000"
+
+# Optional background socket polling interval in seconds.
+# Default is 0 (disabled), meaning pure event-driven mode:
+# sockets are discovered at startup and dynamically registered via `--client`.
+# poll_interval = 0
