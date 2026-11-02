@@ -1,5 +1,9 @@
 # niri-screenshot-daemon
 
+[![CI](https://github.com/broli/niri-screenshot-daemon/actions/workflows/ci.yml/badge.svg)](https://github.com/broli/niri-screenshot-daemon/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/broli/niri-screenshot-daemon)](https://github.com/broli/niri-screenshot-daemon/releases/latest)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
+
 A lightweight, event-driven screenshot watchdog that bridges [Niri](https://github.com/YaLTeR/niri) compositor screenshot events to [Satty](https://github.com/gabm/Satty) for instant annotation.
 
 > **Note on repository naming:** This project replaces my legacy KDE Spectacle daemon workflow onto Niri (hence the workspace directory name `niri-spectacle-daemon`) with a dedicated native Rust daemon (`niri-screenshot-daemon`) driving Satty.
