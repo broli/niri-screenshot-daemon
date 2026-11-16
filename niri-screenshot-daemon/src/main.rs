@@ -1,16 +1,23 @@
+mod notifications;
+
 use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{sleep, spawn};
 use std::time::Duration;
 
 use clap::Parser;
 use serde::{Deserialize, Serialize};
+
+use crate::notifications::Notifier;
+
+const DEFAULT_NOTIFY_TIMEOUT_MS: i32 = 5000;
 
 const SCREENSHOT_DELAYS: [Duration; 3] = [
     Duration::from_millis(4),
@@ -51,6 +58,14 @@ struct Cli {
     /// Optional background polling interval in seconds (0 = disabled, event-driven socket monitoring only)
     #[arg(long, default_value = "0", value_name = "SECS")]
     poll_interval: u64,
+
+    /// Launch satty immediately on screenshot instead of showing a clickable notification
+    #[arg(long)]
+    immediate: bool,
+
+    /// Notification expiration timeout in milliseconds (-1 = server default, 0 = never expire)
+    #[arg(long, value_name = "MS", allow_negative_numbers = true)]
+    notify_timeout: Option<i32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -61,14 +76,91 @@ struct FileConfig {
     host_wayland: Option<String>,
     host_runtime: Option<String>,
     poll_interval: Option<u64>,
+    immediate: Option<bool>,
+    notify_timeout: Option<i32>,
 }
 
-struct Config {
-    host_wayland: String,
-    host_runtime: String,
-    runtime_dir: PathBuf,
+#[derive(Default)]
+struct ClipboardState {
+    next_seq: AtomicU64,
+    last_copied_seq: Mutex<u64>,
+}
+
+impl ClipboardState {
+    fn next_capture_seq(&self) -> u64 {
+        self.next_seq.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn run_if_latest(&self, seq: u64, copy_fn: impl FnOnce() -> bool) -> bool {
+        let mut last_copied = self
+            .last_copied_seq
+            .lock()
+            .expect("clipboard lock poisoned");
+        if seq <= *last_copied {
+            return false;
+        }
+        if copy_fn() {
+            *last_copied = seq;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[derive(Default)]
+struct ReaperInner {
+    started: bool,
+    children: Vec<Child>,
+}
+
+#[derive(Clone, Default)]
+struct ChildReaper {
+    state: Arc<(Mutex<ReaperInner>, Condvar)>,
+}
+
+impl ChildReaper {
+    fn track(&self, child: Child) {
+        let (lock, cvar) = &*self.state;
+        let mut inner = lock.lock().expect("reaper lock poisoned");
+        inner.children.push(child);
+        if !inner.started {
+            inner.started = true;
+            let state = Arc::clone(&self.state);
+            spawn(move || Self::reap_loop(&state));
+        }
+        cvar.notify_one();
+    }
+
+    fn reap_loop(state: &(Mutex<ReaperInner>, Condvar)) {
+        let (lock, cvar) = state;
+        let mut inner = lock.lock().expect("reaper lock poisoned");
+        loop {
+            while inner.children.is_empty() {
+                inner = cvar.wait(inner).expect("reaper lock poisoned");
+            }
+            inner
+                .children
+                .retain_mut(|child| matches!(child.try_wait(), Ok(None)));
+            if !inner.children.is_empty() {
+                let (guard, _) = cvar
+                    .wait_timeout(inner, Duration::from_millis(250))
+                    .expect("reaper lock poisoned");
+                inner = guard;
+            }
+        }
+    }
+}
+
+pub(crate) struct Config {
+    pub(crate) host_wayland: String,
+    pub(crate) runtime_dir: PathBuf,
     extra_paths: HashSet<PathBuf>,
     poll_interval: u64,
+    immediate: bool,
+    pub(crate) notify_timeout: i32,
+    clipboard: ClipboardState,
+    reaper: ChildReaper,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -118,7 +210,76 @@ fn wait_for_screenshot_file(path: &Path, delays: &[Duration]) -> bool {
     false
 }
 
-fn on_screenshot(path: &Path, config: &Config) {
+fn copy_to_clipboard(path: &Path, config: &Config, seq: u64) -> bool {
+    config.clipboard.run_if_latest(seq, || {
+        let file = match fs::File::open(path) {
+            Ok(file) => file,
+            Err(err) => {
+                eprintln!(
+                    "[niri-screenshot-daemon] Failed to open {} for clipboard copy: {err}",
+                    path.display()
+                );
+                return false;
+            }
+        };
+
+        let mut cmd = Command::new("wl-copy");
+        cmd.env("WAYLAND_DISPLAY", &config.host_wayland)
+            .env("XDG_RUNTIME_DIR", &config.runtime_dir);
+        if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
+        {
+            cmd.args(["--type", "image/png"]);
+        }
+        cmd.stdin(file).stdout(Stdio::null()).stderr(Stdio::null());
+
+        match cmd.status() {
+            Ok(status) if status.success() => true,
+            Ok(status) => {
+                eprintln!(
+                    "[niri-screenshot-daemon] wl-copy exited with status {status} for {}",
+                    path.display()
+                );
+                false
+            }
+            Err(err) => {
+                eprintln!(
+                    "[niri-screenshot-daemon] Failed to launch wl-copy for {}: {err}",
+                    path.display()
+                );
+                false
+            }
+        }
+    })
+}
+
+pub(crate) fn launch_satty(path: &Path, config: &Config) {
+    println!(
+        "[niri-screenshot-daemon] Launching satty on host ({}) for {}",
+        config.host_wayland,
+        path.display()
+    );
+
+    match Command::new("satty")
+        .env("WAYLAND_DISPLAY", &config.host_wayland)
+        .env("XDG_RUNTIME_DIR", &config.runtime_dir)
+        .arg("--filename")
+        .arg(path)
+        .arg("--output-filename")
+        .arg(path)
+        .args(["--copy-command", "wl-copy", "--early-exit", "copy,save"])
+        .spawn()
+    {
+        Ok(child) => config.reaper.track(child),
+        Err(err) => eprintln!(
+            "[niri-screenshot-daemon] Failed to launch satty for {}: {err}",
+            path.display()
+        ),
+    }
+}
+
+fn on_screenshot(path: &Path, config: &Config, seq: u64, notifier: Option<&Notifier>) {
     if !wait_for_screenshot_file(path, &SCREENSHOT_DELAYS) {
         eprintln!(
             "[niri-screenshot-daemon] Screenshot file not found after retries: {}",
@@ -127,27 +288,28 @@ fn on_screenshot(path: &Path, config: &Config) {
         return;
     }
 
+    let copied = copy_to_clipboard(path, config, seq);
+
+    let Some(notifier) = notifier else {
+        launch_satty(path, config);
+        return;
+    };
+
+    let state = if copied {
+        "copied to clipboard"
+    } else {
+        "saved (clipboard copy failed)"
+    };
     println!(
-        "[niri-screenshot-daemon] Screenshot detected: {}. Launching satty on host ({})",
-        path.display(),
-        config.host_wayland
+        "[niri-screenshot-daemon] Screenshot {state}: {}. Sending notification...",
+        path.display()
     );
 
-    match Command::new("satty")
-        .env("WAYLAND_DISPLAY", &config.host_wayland)
-        .env("XDG_RUNTIME_DIR", &config.host_runtime)
-        .arg("--filename")
-        .arg(path)
-        .arg("--output-filename")
-        .arg(path)
-        .args(["--copy-command", "wl-copy", "--early-exit", "copy,save"])
-        .spawn()
-    {
-        Ok(_) => {}
-        Err(err) => eprintln!(
-            "[niri-screenshot-daemon] Failed to launch satty for {}: {err}",
-            path.display()
-        ),
+    if let Err(err) = notifier.notify_screenshot(path, copied) {
+        eprintln!(
+            "[niri-screenshot-daemon] Notification failed ({err}); launching satty directly."
+        );
+        launch_satty(path, config);
     }
 }
 
@@ -155,6 +317,7 @@ fn listen_to_socket(
     sock_path: &Path,
     active_sockets: &Arc<Mutex<HashSet<PathBuf>>>,
     config: &Arc<Config>,
+    notifier: Option<&Notifier>,
 ) {
     println!(
         "[niri-screenshot-daemon] Connected to Niri socket: {}",
@@ -174,9 +337,11 @@ fn listen_to_socket(
                     if let Ok(event) = serde_json::from_str::<NiriEvent>(&line)
                         && let Some(captured) = event.screenshot_captured
                     {
+                        let seq = config.clipboard.next_capture_seq();
                         let cfg = Arc::clone(config);
+                        let notif = notifier.cloned();
                         spawn(move || {
-                            on_screenshot(&captured.path, &cfg);
+                            on_screenshot(&captured.path, &cfg, seq, notif.as_ref());
                         });
                     }
                 }
@@ -204,13 +369,15 @@ fn start_monitoring_socket(
     sock: PathBuf,
     active_sockets: &Arc<Mutex<HashSet<PathBuf>>>,
     config: &Arc<Config>,
+    notifier: Option<&Notifier>,
 ) -> Option<std::thread::JoinHandle<()>> {
     let mut set = active_sockets.lock().expect("active_sockets lock poisoned");
     if set.insert(sock.clone()) {
         let set_clone = Arc::clone(active_sockets);
         let config_clone = Arc::clone(config);
+        let notifier_clone = notifier.cloned();
         Some(spawn(move || {
-            listen_to_socket(&sock, &set_clone, &config_clone);
+            listen_to_socket(&sock, &set_clone, &config_clone, notifier_clone.as_ref());
         }))
     } else {
         None
@@ -354,6 +521,7 @@ fn handle_control_connection(
     mut stream: UnixStream,
     active_sockets: &Arc<Mutex<HashSet<PathBuf>>>,
     config: &Arc<Config>,
+    notifier: Option<&Notifier>,
 ) {
     let mut reader = BufReader::new(&stream);
     let mut line = String::new();
@@ -362,7 +530,9 @@ fn handle_control_connection(
             Ok(ControlRequest::AddSockets { sockets }) => {
                 let mut added = Vec::new();
                 for sock in sockets {
-                    if start_monitoring_socket(sock.clone(), active_sockets, config).is_some() {
+                    if start_monitoring_socket(sock.clone(), active_sockets, config, notifier)
+                        .is_some()
+                    {
                         added.push(sock);
                     }
                 }
@@ -394,10 +564,11 @@ fn run_control_server(
     listener: UnixListener,
     active_sockets: Arc<Mutex<HashSet<PathBuf>>>,
     config: Arc<Config>,
+    notifier: Option<Notifier>,
 ) {
     spawn(move || {
         for stream in listener.incoming().map_while(Result::ok) {
-            handle_control_connection(stream, &active_sockets, &config);
+            handle_control_connection(stream, &active_sockets, &config, notifier.as_ref());
         }
     });
 }
@@ -491,18 +662,16 @@ fn bind_control_listener(
     }
 }
 
-fn run_daemon(
+fn build_daemon_config(
     cli: &Cli,
     file_config: FileConfig,
-    control_socket_path: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<Config, Box<dyn std::error::Error>> {
     let uid = rustix::process::getuid().as_raw();
-    let host_runtime = cli
+    let runtime_dir = cli
         .runtime_dir
-        .as_ref()
-        .map(|p| p.to_string_lossy().into_owned())
-        .or(file_config.host_runtime)
-        .unwrap_or_else(|| format!("/run/user/{uid}"));
+        .clone()
+        .or_else(|| file_config.host_runtime.map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from(format!("/run/user/{uid}")));
 
     let host_wayland = cli
         .wayland_display
@@ -516,7 +685,17 @@ fn run_daemon(
         file_config.poll_interval.unwrap_or(0)
     };
 
-    let runtime_dir = PathBuf::from(&host_runtime);
+    let immediate = cli.immediate || file_config.immediate.unwrap_or(false);
+    let notify_timeout = cli
+        .notify_timeout
+        .or(file_config.notify_timeout)
+        .unwrap_or(DEFAULT_NOTIFY_TIMEOUT_MS);
+    if notify_timeout < -1 {
+        return Err(format!(
+            "Invalid notify_timeout {notify_timeout}: must be >= -1 (-1 = server default, 0 = never expire)"
+        )
+        .into());
+    }
 
     let mut extra_paths: HashSet<PathBuf> = file_config.extra_sockets;
     if let Ok(env_extra) = env::var("NIRI_EXTRA_SOCKETS") {
@@ -531,34 +710,73 @@ fn run_daemon(
         extra_paths.insert(sock.clone());
     }
 
-    let control_listener = bind_control_listener(control_socket_path)?;
-    let _socket_cleaner = SocketCleaner(control_socket_path.to_path_buf());
+    Ok(Config {
+        host_wayland,
+        runtime_dir,
+        extra_paths,
+        poll_interval,
+        immediate,
+        notify_timeout,
+        clipboard: ClipboardState::default(),
+        reaper: ChildReaper::default(),
+    })
+}
 
+fn print_startup_banner(config: &Config, control_socket_path: &Path) {
     println!("============================================================");
     println!(" [niri-screenshot-daemon] Host Screenshot Watchdog ");
-    println!(" Host Wayland:   {host_wayland} (Runtime: {host_runtime})");
+    println!(
+        " Host Wayland:   {} (Runtime: {})",
+        config.host_wayland,
+        config.runtime_dir.display()
+    );
     println!(" Control Socket: {}", control_socket_path.display());
-    if !extra_paths.is_empty() {
-        let paths_display = extra_paths
+    if !config.extra_paths.is_empty() {
+        let paths_display = config
+            .extra_paths
             .iter()
             .map(|p| p.display().to_string())
             .collect::<Vec<_>>()
             .join(", ");
         println!(" Extra monitored paths: {paths_display}");
     }
-    if poll_interval == 0 {
+    if config.poll_interval == 0 {
         println!(" Mode: Pure event-driven (zero background polling)");
     } else {
-        println!(" Mode: Polling directories every {poll_interval}s");
+        println!(" Mode: Polling directories every {}s", config.poll_interval);
     }
+    let action_desc = if config.immediate {
+        "Immediate Satty launch".to_string()
+    } else {
+        let timeout = match config.notify_timeout {
+            -1 => "server default timeout".to_string(),
+            0 => "no auto-expire".to_string(),
+            ms => format!("{ms}ms timeout"),
+        };
+        format!("D-Bus notification ({timeout}) -> click to launch Satty")
+    };
+    println!(" Action: {action_desc}");
     println!("============================================================");
+}
 
-    let config = Arc::new(Config {
-        host_wayland,
-        host_runtime,
-        runtime_dir,
-        extra_paths,
-        poll_interval,
+fn run_daemon(
+    cli: &Cli,
+    file_config: FileConfig,
+    control_socket_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = Arc::new(build_daemon_config(cli, file_config)?);
+
+    let control_listener = bind_control_listener(control_socket_path)?;
+    let _socket_cleaner = SocketCleaner(control_socket_path.to_path_buf());
+
+    print_startup_banner(&config, control_socket_path);
+
+    let prefer_host_runtime_bus =
+        env::var_os("XDG_RUNTIME_DIR").is_some_and(|dir| Path::new(&dir) != config.runtime_dir);
+    let notifier = (!config.immediate).then(|| {
+        let n = Notifier::new(Arc::clone(&config), prefer_host_runtime_bus);
+        n.start_listener();
+        n
     });
 
     let active_sockets: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
@@ -567,6 +785,7 @@ fn run_daemon(
         control_listener,
         Arc::clone(&active_sockets),
         Arc::clone(&config),
+        notifier.clone(),
     );
 
     let initial_sockets = wait_for_sockets(
@@ -583,7 +802,9 @@ fn run_daemon(
         );
     } else {
         for sock in initial_sockets {
-            if let Some(handle) = start_monitoring_socket(sock, &active_sockets, &config) {
+            if let Some(handle) =
+                start_monitoring_socket(sock, &active_sockets, &config, notifier.as_ref())
+            {
                 host_handles.push(handle);
             }
         }
@@ -602,7 +823,7 @@ fn run_daemon(
         loop {
             let discovered = scan_sockets(&config.runtime_dir, &config.extra_paths);
             for sock in discovered {
-                start_monitoring_socket(sock, &active_sockets, &config);
+                start_monitoring_socket(sock, &active_sockets, &config, notifier.as_ref());
             }
             sleep(Duration::from_secs(config.poll_interval));
         }
@@ -659,6 +880,8 @@ mod tests {
             host_wayland = "wayland-1"
             host_runtime = "/run/user/1001"
             poll_interval = 30
+            immediate = true
+            notify_timeout = 3500
         "#;
         let cfg: FileConfig = toml::from_str(toml_str).expect("valid config");
         assert_eq!(cfg.extra_sockets.len(), 2);
@@ -670,6 +893,8 @@ mod tests {
         assert_eq!(cfg.host_wayland.as_deref(), Some("wayland-1"));
         assert_eq!(cfg.host_runtime.as_deref(), Some("/run/user/1001"));
         assert_eq!(cfg.poll_interval, Some(30));
+        assert_eq!(cfg.immediate, Some(true));
+        assert_eq!(cfg.notify_timeout, Some(3500));
     }
 
     #[test]
@@ -697,17 +922,19 @@ mod tests {
         let active_sockets: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
         let config = Arc::new(Config {
             host_wayland: "wayland-0".into(),
-            host_runtime: "/run/user/1000".into(),
             runtime_dir: PathBuf::from("/run/user/1000"),
             extra_paths: HashSet::new(),
             poll_interval: 0,
+            immediate: false,
+            notify_timeout: DEFAULT_NOTIFY_TIMEOUT_MS,
+            clipboard: ClipboardState::default(),
+            reaper: ChildReaper::default(),
         });
-
         let active_clone = Arc::clone(&active_sockets);
         let config_clone = Arc::clone(&config);
         let server_handle = spawn(move || {
             if let Ok((stream, _)) = listener.accept() {
-                handle_control_connection(stream, &active_clone, &config_clone);
+                handle_control_connection(stream, &active_clone, &config_clone, None);
             }
         });
 
@@ -752,5 +979,52 @@ mod tests {
         fs::write(&temp_file, b"test").unwrap();
         assert!(wait_for_screenshot_file(&temp_file, &SCREENSHOT_DELAYS));
         let _ = fs::remove_file(&temp_file);
+    }
+
+    #[test]
+    fn test_notify_timeout_cli_and_validation() {
+        let cli = Cli::try_parse_from(["niri-screenshot-daemon", "--notify-timeout", "-1"])
+            .expect("-1 should parse");
+        let cfg = build_daemon_config(&cli, FileConfig::default()).expect("-1 should be valid");
+        assert_eq!(cfg.notify_timeout, -1);
+
+        let invalid_cli = Cli::try_parse_from(["niri-screenshot-daemon", "--notify-timeout", "-2"])
+            .expect("-2 should parse");
+        assert!(build_daemon_config(&invalid_cli, FileConfig::default()).is_err());
+    }
+
+    #[test]
+    fn test_clipboard_state_capture_order() {
+        let state = ClipboardState::default();
+        let seq1 = state.next_capture_seq();
+        let seq2 = state.next_capture_seq();
+        assert!(seq2 > seq1);
+
+        // Newer capture completes first and updates the clipboard.
+        assert!(state.run_if_latest(seq2, || true));
+        // Older, slower capture must not overwrite the newer clipboard entry.
+        assert!(!state.run_if_latest(seq1, || { panic!("stale capture should not run copy_fn") }));
+    }
+
+    #[test]
+    fn test_child_reaper_reaps_exited_child() {
+        let reaper = ChildReaper::default();
+        let child = Command::new("true").spawn().expect("spawn `true`");
+        reaper.track(child);
+
+        for _ in 0..20 {
+            sleep(Duration::from_millis(20));
+            if reaper
+                .state
+                .0
+                .lock()
+                .expect("reaper lock poisoned")
+                .children
+                .is_empty()
+            {
+                return;
+            }
+        }
+        panic!("ChildReaper did not reap exited child in time");
     }
 }

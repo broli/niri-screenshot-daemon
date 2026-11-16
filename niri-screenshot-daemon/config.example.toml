@@ -22,3 +22,11 @@ extra_sockets = [
 # Default is 0 (disabled), meaning pure event-driven mode:
 # sockets are discovered at startup and dynamically registered via `--client`.
 # poll_interval = 0
+
+# Launch Satty immediately upon screenshot capture instead of showing a
+# clickable D-Bus notification first (default: false).
+# immediate = false
+
+# Notification expiration timeout in milliseconds (default: 5000).
+# Use -1 for the notification server's default timeout, or 0 for no auto-expire.
+# notify_timeout = 5000
