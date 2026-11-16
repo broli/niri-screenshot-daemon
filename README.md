@@ -4,7 +4,7 @@
 [![Release](https://img.shields.io/github/v/release/broli/niri-screenshot-daemon)](https://github.com/broli/niri-screenshot-daemon/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
 
-A lightweight, event-driven screenshot watchdog that bridges [Niri](https://github.com/YaLTeR/niri) compositor screenshot events to [Satty](https://github.com/gabm/Satty) for instant annotation.
+A lightweight, event-driven screenshot watchdog that bridges [Niri](https://github.com/YaLTeR/niri) compositor screenshot events to the Wayland clipboard, desktop notifications (`org.freedesktop.Notifications`), and [Satty](https://github.com/gabm/Satty) for annotation.
 
 > **Note on repository naming:** This project replaces my legacy KDE Spectacle daemon workflow onto Niri (hence the workspace directory name `niri-spectacle-daemon`) with a dedicated native Rust daemon (`niri-screenshot-daemon`) driving Satty.
 
@@ -14,10 +14,12 @@ A lightweight, event-driven screenshot watchdog that bridges [Niri](https://gith
 
 1. **Event-driven IPC**: Connects directly to Niri's UNIX domain socket and reads the native `"EventStream"` JSON feed. When idle, the process remains suspended in a blocking socket read (0% CPU).
 2. **File Flush Verification (Fast-Path & Fallback)**:
-   - **4 ms initial check**: Niri writes screenshots asynchronously. On modern NVMe/SSD storage, the file is usually finalized within a couple of milliseconds. The daemon tests at the 4 ms mark to launch Satty with near-zero latency.
+   - **4 ms initial check**: Niri writes screenshots asynchronously. On modern NVMe/SSD storage, the file is usually finalized within a couple of milliseconds. The daemon tests at the 4 ms mark to react with near-zero latency.
    - **1-second fallback retries**: If disk sync or compositor encoding takes longer, the daemon retries with 1-second delays (up to ~2 seconds total) before reporting an error.
-3. **Multi-Session / Nested Compositor Support**: Only **one** daemon runs on the host compositor. When running nested Niri sessions (e.g. nested sessions, development sandboxes, containerized environments), the nested session calls `niri-screenshot-daemon --client`. The client transmits the nested socket path to the host daemon via a control socket and exits immediately.
-4. **Unified Host UI**: When a screenshot is triggered inside *either* the host or any registered nested session, Satty is spawned strictly on the host `WAYLAND_DISPLAY`, keeping all annotation windows on the primary display.
+3. **Instant Host Clipboard Copy**: Automatically copies the captured screenshot to the host Wayland clipboard via `wl-copy` (so screenshots from both host and nested Niri sessions are immediately available in your copy buffer).
+4. **Spectacle-Style Click-to-Annotate Notification**: Sends a native D-Bus notification (`org.freedesktop.Notifications`) with a thumbnail preview (`image-path`) and `"default"` action. Ignore it to keep the screenshot in your clipboard, or click it to launch Satty (falling back to immediate launch if no notification daemon is available, or pass `--immediate` to always open Satty right away).
+5. **Multi-Session / Nested Compositor Support**: Only **one** daemon runs on the host compositor. When running nested Niri sessions (e.g. nested sessions, development sandboxes, containerized environments), the nested session calls `niri-screenshot-daemon --client`. The client transmits the nested socket path to the host daemon via a control socket and exits immediately.
+6. **Unified Host UI**: When a screenshot is triggered inside *either* the host or any registered nested session, notifications and Satty run strictly on the host `WAYLAND_DISPLAY`, keeping all UI on the primary display.
 
 ---
 
@@ -135,6 +137,12 @@ extra_sockets = [
 
 # Optional background polling interval in seconds (default 0 = disabled, pure event-driven)
 # poll_interval = 0
+
+# Launch Satty immediately instead of showing a clickable notification (default false)
+# immediate = false
+
+# Notification expiration timeout in milliseconds (default 5000; -1 = server default, 0 = never)
+# notify_timeout = 5000
 ```
 
 ---
@@ -150,6 +158,8 @@ extra_sockets = [
 | `--wayland-display <NAME>` | Target Wayland display for Satty (defaults to `$WAYLAND_DISPLAY` or `wayland-0`). |
 | `--runtime-dir <PATH>` | Target runtime directory for Satty (defaults to `$XDG_RUNTIME_DIR` or `/run/user/<UID>`). |
 | `--poll-interval <SECS>` | Optional directory polling interval (default: `0`, event-driven mode). |
+| `--immediate` | Launch Satty immediately on screenshot instead of showing a clickable notification. |
+| `--notify-timeout <MS>` | Notification timeout in milliseconds (`5000` default, `-1` server default, `0` never expire). |
 
 ---
 
