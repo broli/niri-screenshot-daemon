@@ -259,37 +259,41 @@ impl Notifier {
             ("category", Value::from("screenshot")),
         ]);
 
-        let reply = conn
-            .call_method(
-                Some(NOTIFICATIONS_DEST),
-                NOTIFICATIONS_PATH,
-                Some(NOTIFICATIONS_IFACE),
-                "Notify",
-                &(
-                    "niri-screenshot-daemon",
-                    0u32,
-                    "camera-photo",
-                    "Screenshot captured",
-                    body.as_str(),
-                    ["default", "Annotate"].as_slice(),
-                    hints,
-                    self.config.notify_timeout,
-                ),
-            )
-            .map_err(|err| {
+        let mut pending = self
+            .pending
+            .lock()
+            .expect("pending notifications lock poisoned");
+
+        let reply = match conn.call_method(
+            Some(NOTIFICATIONS_DEST),
+            NOTIFICATIONS_PATH,
+            Some(NOTIFICATIONS_IFACE),
+            "Notify",
+            &(
+                "niri-screenshot-daemon",
+                0u32,
+                "camera-photo",
+                "Screenshot captured",
+                body.as_str(),
+                ["default", "Annotate"].as_slice(),
+                hints,
+                self.config.notify_timeout,
+            ),
+        ) {
+            Ok(reply) => reply,
+            Err(err) => {
+                drop(pending);
                 self.reset_connection(&conn);
-                format!("D-Bus Notify call failed: {err}")
-            })?;
+                return Err(format!("D-Bus Notify call failed: {err}"));
+            }
+        };
 
         let id: u32 = reply
             .body()
             .deserialize()
             .map_err(|err| format!("Invalid D-Bus Notify reply: {err}"))?;
 
-        self.pending
-            .lock()
-            .expect("pending notifications lock poisoned")
-            .insert(id, path.to_path_buf(), Instant::now());
+        pending.insert(id, path.to_path_buf(), Instant::now());
 
         Ok(id)
     }
