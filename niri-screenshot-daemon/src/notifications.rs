@@ -17,39 +17,54 @@ const NOTIFICATIONS_PATH: &str = "/org/freedesktop/Notifications";
 const NOTIFICATIONS_IFACE: &str = "org.freedesktop.Notifications";
 
 const MAX_PENDING: usize = 32;
-const PENDING_TTL: Duration = Duration::from_secs(300);
+const HISTORY_TTL: Duration = Duration::from_secs(300);
 
-const REASON_DISMISSED: u32 = 2;
-const REASON_CLOSED_BY_CALL: u32 = 3;
+const REASON_EXPIRED: u32 = 1;
+
+#[derive(Debug)]
+struct PendingEntry {
+    id: u32,
+    path: PathBuf,
+    expires_at: Option<Instant>,
+}
 
 #[derive(Debug, Default)]
-struct PendingNotifications(VecDeque<(u32, PathBuf, Instant)>);
+struct PendingNotifications(VecDeque<PendingEntry>);
 
 impl PendingNotifications {
     fn prune(&mut self, now: Instant) {
-        while let Some((_, _, ts)) = self.0.front() {
-            if now.duration_since(*ts) > PENDING_TTL || self.0.len() > MAX_PENDING {
-                self.0.pop_front();
-            } else {
-                break;
-            }
+        self.0
+            .retain(|entry| entry.expires_at.is_none_or(|exp| now < exp));
+        while self.0.len() > MAX_PENDING {
+            self.0.pop_front();
         }
     }
 
     fn insert(&mut self, id: u32, path: PathBuf, now: Instant) {
-        self.0.retain(|(existing, _, _)| *existing != id);
-        self.0.push_back((id, path, now));
+        self.0.retain(|entry| entry.id != id);
+        self.0.push_back(PendingEntry {
+            id,
+            path,
+            expires_at: None,
+        });
         self.prune(now);
     }
 
     fn take(&mut self, id: u32, now: Instant) -> Option<PathBuf> {
         self.prune(now);
-        let pos = self.0.iter().position(|(existing, _, _)| *existing == id)?;
-        self.0.remove(pos).map(|(_, path, _)| path)
+        let pos = self.0.iter().position(|entry| entry.id == id)?;
+        self.0.remove(pos).map(|entry| entry.path)
     }
 
-    fn remove(&mut self, id: u32) {
-        self.0.retain(|(existing, _, _)| *existing != id);
+    fn on_closed(&mut self, id: u32, reason: u32, now: Instant) {
+        if reason == REASON_EXPIRED {
+            if let Some(entry) = self.0.iter_mut().find(|entry| entry.id == id) {
+                entry.expires_at = Some(now + HISTORY_TTL);
+            }
+            self.prune(now);
+        } else {
+            self.0.retain(|entry| entry.id != id);
+        }
     }
 }
 
@@ -199,18 +214,15 @@ impl Notifier {
                             .expect("pending notifications lock poisoned")
                             .take(id, Instant::now())
                     {
-                        let cfg = Arc::clone(&self.config);
-                        spawn(move || crate::launch_satty(&path, &cfg));
+                        crate::launch_satty(&path, &self.config);
                     }
                 }
                 "NotificationClosed" => {
-                    if let Ok((id, reason)) = msg.body().deserialize::<(u32, u32)>()
-                        && (reason == REASON_DISMISSED || reason == REASON_CLOSED_BY_CALL)
-                    {
+                    if let Ok((id, reason)) = msg.body().deserialize::<(u32, u32)>() {
                         self.pending
                             .lock()
                             .expect("pending notifications lock poisoned")
-                            .remove(id);
+                            .on_closed(id, reason, Instant::now());
                     }
                 }
                 _ => {}
@@ -325,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pending_notifications_eviction_and_remove() {
+    fn test_pending_notifications_eviction_and_close_reasons() {
         let mut pending = PendingNotifications::default();
         let now = Instant::now();
         let max_pending = u32::try_from(MAX_PENDING).expect("MAX_PENDING fits in u32");
@@ -336,7 +348,23 @@ mod tests {
         assert!(pending.take(1, now).is_none());
         assert!(pending.take(max_pending + 5, now).is_some());
 
-        pending.remove(max_pending + 4);
-        assert!(pending.take(max_pending + 4, now).is_none());
+        // Open notifications (never closed) survive beyond HISTORY_TTL (e.g. notify_timeout = 0).
+        let later = now + HISTORY_TTL + Duration::from_secs(3600);
+        assert!(pending.take(max_pending + 4, later).is_some());
+
+        // Expired notification stays available during HISTORY_TTL, then is pruned.
+        pending.on_closed(max_pending + 3, REASON_EXPIRED, now);
+        assert!(
+            pending
+                .take(max_pending + 3, now + Duration::from_secs(10))
+                .is_some()
+        );
+        pending.insert(max_pending + 10, PathBuf::from("/tmp/expired.png"), now);
+        pending.on_closed(max_pending + 10, REASON_EXPIRED, now);
+        assert!(pending.take(max_pending + 10, later).is_none());
+
+        // Explicitly dismissed notification is removed immediately.
+        pending.on_closed(max_pending + 2, 2, now);
+        assert!(pending.take(max_pending + 2, now).is_none());
     }
 }

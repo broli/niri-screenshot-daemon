@@ -6,9 +6,9 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{sleep, spawn};
 use std::time::Duration;
 
@@ -108,6 +108,50 @@ impl ClipboardState {
     }
 }
 
+#[derive(Default)]
+struct ReaperInner {
+    started: bool,
+    children: Vec<Child>,
+}
+
+#[derive(Clone, Default)]
+struct ChildReaper {
+    state: Arc<(Mutex<ReaperInner>, Condvar)>,
+}
+
+impl ChildReaper {
+    fn track(&self, child: Child) {
+        let (lock, cvar) = &*self.state;
+        let mut inner = lock.lock().expect("reaper lock poisoned");
+        inner.children.push(child);
+        if !inner.started {
+            inner.started = true;
+            let state = Arc::clone(&self.state);
+            spawn(move || Self::reap_loop(&state));
+        }
+        cvar.notify_one();
+    }
+
+    fn reap_loop(state: &(Mutex<ReaperInner>, Condvar)) {
+        let (lock, cvar) = state;
+        let mut inner = lock.lock().expect("reaper lock poisoned");
+        loop {
+            while inner.children.is_empty() {
+                inner = cvar.wait(inner).expect("reaper lock poisoned");
+            }
+            inner
+                .children
+                .retain_mut(|child| matches!(child.try_wait(), Ok(None)));
+            if !inner.children.is_empty() {
+                let (guard, _) = cvar
+                    .wait_timeout(inner, Duration::from_millis(250))
+                    .expect("reaper lock poisoned");
+                inner = guard;
+            }
+        }
+    }
+}
+
 pub(crate) struct Config {
     pub(crate) host_wayland: String,
     pub(crate) runtime_dir: PathBuf,
@@ -116,6 +160,7 @@ pub(crate) struct Config {
     immediate: bool,
     pub(crate) notify_timeout: i32,
     clipboard: ClipboardState,
+    reaper: ChildReaper,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -224,13 +269,9 @@ pub(crate) fn launch_satty(path: &Path, config: &Config) {
         .arg("--output-filename")
         .arg(path)
         .args(["--copy-command", "wl-copy", "--early-exit", "copy,save"])
-        .status()
+        .spawn()
     {
-        Ok(status) if !status.success() => eprintln!(
-            "[niri-screenshot-daemon] satty exited with status {status} for {}",
-            path.display()
-        ),
-        Ok(_) => {}
+        Ok(child) => config.reaper.track(child),
         Err(err) => eprintln!(
             "[niri-screenshot-daemon] Failed to launch satty for {}: {err}",
             path.display()
@@ -677,6 +718,7 @@ fn build_daemon_config(
         immediate,
         notify_timeout,
         clipboard: ClipboardState::default(),
+        reaper: ChildReaper::default(),
     })
 }
 
@@ -886,6 +928,7 @@ mod tests {
             immediate: false,
             notify_timeout: DEFAULT_NOTIFY_TIMEOUT_MS,
             clipboard: ClipboardState::default(),
+            reaper: ChildReaper::default(),
         });
         let active_clone = Arc::clone(&active_sockets);
         let config_clone = Arc::clone(&config);
@@ -961,5 +1004,27 @@ mod tests {
         assert!(state.run_if_latest(seq2, || true));
         // Older, slower capture must not overwrite the newer clipboard entry.
         assert!(!state.run_if_latest(seq1, || { panic!("stale capture should not run copy_fn") }));
+    }
+
+    #[test]
+    fn test_child_reaper_reaps_exited_child() {
+        let reaper = ChildReaper::default();
+        let child = Command::new("true").spawn().expect("spawn `true`");
+        reaper.track(child);
+
+        for _ in 0..20 {
+            sleep(Duration::from_millis(20));
+            if reaper
+                .state
+                .0
+                .lock()
+                .expect("reaper lock poisoned")
+                .children
+                .is_empty()
+            {
+                return;
+            }
+        }
+        panic!("ChildReaper did not reap exited child in time");
     }
 }
