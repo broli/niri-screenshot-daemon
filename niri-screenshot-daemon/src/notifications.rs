@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::spawn;
 use std::time::{Duration, Instant};
 
@@ -118,18 +118,38 @@ impl Notifier {
 
     pub(crate) fn start_listener(&self) {
         let notifier = self.clone();
+        let (ready_tx, ready_rx) = mpsc::sync_channel::<()>(1);
         spawn(move || {
+            let mut ready_tx = Some(ready_tx);
             loop {
                 match notifier.get_or_connect() {
                     Ok(conn) => {
-                        if let Err(err) = notifier.listen_signals(&conn) {
-                            eprintln!(
-                                "[niri-screenshot-daemon] D-Bus notification listener disconnected: {err}"
-                            );
+                        match notifier.subscribe_signals(&conn) {
+                            Ok(iter) => {
+                                if let Some(tx) = ready_tx.take() {
+                                    let _ = tx.send(());
+                                }
+                                if let Err(err) = notifier.process_signals(iter) {
+                                    eprintln!(
+                                        "[niri-screenshot-daemon] D-Bus notification listener disconnected: {err}"
+                                    );
+                                }
+                            }
+                            Err(err) => {
+                                if let Some(tx) = ready_tx.take() {
+                                    let _ = tx.send(());
+                                }
+                                eprintln!(
+                                    "[niri-screenshot-daemon] Failed to subscribe to D-Bus notification signals: {err}"
+                                );
+                            }
                         }
                         notifier.reset_connection(&conn);
                     }
                     Err(err) => {
+                        if let Some(tx) = ready_tx.take() {
+                            let _ = tx.send(());
+                        }
                         eprintln!(
                             "[niri-screenshot-daemon] D-Bus session bus unavailable ({err}); retrying in 5s..."
                         );
@@ -147,16 +167,23 @@ impl Notifier {
                 );
             }
         });
+        let _ = ready_rx.recv();
     }
 
-    fn listen_signals(&self, conn: &Connection) -> zbus::Result<()> {
+    fn subscribe_signals(&self, conn: &Connection) -> zbus::Result<MessageIterator> {
+        let _ = self;
         let rule = MatchRule::builder()
             .msg_type(MessageType::Signal)
+            .sender(NOTIFICATIONS_DEST)?
             .interface(NOTIFICATIONS_IFACE)?
             .path(NOTIFICATIONS_PATH)?
             .build();
 
-        for msg_res in MessageIterator::for_match_rule(rule, conn, Some(64))? {
+        MessageIterator::for_match_rule(rule, conn, Some(64))
+    }
+
+    fn process_signals(&self, iter: MessageIterator) -> zbus::Result<()> {
+        for msg_res in iter {
             let msg = msg_res?;
             let header = msg.header();
             let Some(member) = header.member() else {

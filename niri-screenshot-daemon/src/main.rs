@@ -7,6 +7,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{sleep, spawn};
 use std::time::Duration;
@@ -79,6 +80,34 @@ struct FileConfig {
     notify_timeout: Option<i32>,
 }
 
+#[derive(Default)]
+struct ClipboardState {
+    next_seq: AtomicU64,
+    last_copied_seq: Mutex<u64>,
+}
+
+impl ClipboardState {
+    fn next_capture_seq(&self) -> u64 {
+        self.next_seq.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn run_if_latest(&self, seq: u64, copy_fn: impl FnOnce() -> bool) -> bool {
+        let mut last_copied = self
+            .last_copied_seq
+            .lock()
+            .expect("clipboard lock poisoned");
+        if seq <= *last_copied {
+            return false;
+        }
+        if copy_fn() {
+            *last_copied = seq;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 pub(crate) struct Config {
     pub(crate) host_wayland: String,
     pub(crate) runtime_dir: PathBuf,
@@ -86,6 +115,7 @@ pub(crate) struct Config {
     poll_interval: u64,
     immediate: bool,
     pub(crate) notify_timeout: i32,
+    clipboard: ClipboardState,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -135,46 +165,48 @@ fn wait_for_screenshot_file(path: &Path, delays: &[Duration]) -> bool {
     false
 }
 
-fn copy_to_clipboard(path: &Path, config: &Config) -> bool {
-    let file = match fs::File::open(path) {
-        Ok(file) => file,
-        Err(err) => {
-            eprintln!(
-                "[niri-screenshot-daemon] Failed to open {} for clipboard copy: {err}",
-                path.display()
-            );
-            return false;
-        }
-    };
+fn copy_to_clipboard(path: &Path, config: &Config, seq: u64) -> bool {
+    config.clipboard.run_if_latest(seq, || {
+        let file = match fs::File::open(path) {
+            Ok(file) => file,
+            Err(err) => {
+                eprintln!(
+                    "[niri-screenshot-daemon] Failed to open {} for clipboard copy: {err}",
+                    path.display()
+                );
+                return false;
+            }
+        };
 
-    let mut cmd = Command::new("wl-copy");
-    cmd.env("WAYLAND_DISPLAY", &config.host_wayland)
-        .env("XDG_RUNTIME_DIR", &config.runtime_dir);
-    if path
-        .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
-    {
-        cmd.args(["--type", "image/png"]);
-    }
-    cmd.stdin(file).stdout(Stdio::null()).stderr(Stdio::null());
+        let mut cmd = Command::new("wl-copy");
+        cmd.env("WAYLAND_DISPLAY", &config.host_wayland)
+            .env("XDG_RUNTIME_DIR", &config.runtime_dir);
+        if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
+        {
+            cmd.args(["--type", "image/png"]);
+        }
+        cmd.stdin(file).stdout(Stdio::null()).stderr(Stdio::null());
 
-    match cmd.status() {
-        Ok(status) if status.success() => true,
-        Ok(status) => {
-            eprintln!(
-                "[niri-screenshot-daemon] wl-copy exited with status {status} for {}",
-                path.display()
-            );
-            false
+        match cmd.status() {
+            Ok(status) if status.success() => true,
+            Ok(status) => {
+                eprintln!(
+                    "[niri-screenshot-daemon] wl-copy exited with status {status} for {}",
+                    path.display()
+                );
+                false
+            }
+            Err(err) => {
+                eprintln!(
+                    "[niri-screenshot-daemon] Failed to launch wl-copy for {}: {err}",
+                    path.display()
+                );
+                false
+            }
         }
-        Err(err) => {
-            eprintln!(
-                "[niri-screenshot-daemon] Failed to launch wl-copy for {}: {err}",
-                path.display()
-            );
-            false
-        }
-    }
+    })
 }
 
 pub(crate) fn launch_satty(path: &Path, config: &Config) {
@@ -206,7 +238,7 @@ pub(crate) fn launch_satty(path: &Path, config: &Config) {
     }
 }
 
-fn on_screenshot(path: &Path, config: &Config, notifier: Option<&Notifier>) {
+fn on_screenshot(path: &Path, config: &Config, seq: u64, notifier: Option<&Notifier>) {
     if !wait_for_screenshot_file(path, &SCREENSHOT_DELAYS) {
         eprintln!(
             "[niri-screenshot-daemon] Screenshot file not found after retries: {}",
@@ -215,7 +247,7 @@ fn on_screenshot(path: &Path, config: &Config, notifier: Option<&Notifier>) {
         return;
     }
 
-    let copied = copy_to_clipboard(path, config);
+    let copied = copy_to_clipboard(path, config, seq);
 
     let Some(notifier) = notifier else {
         launch_satty(path, config);
@@ -264,10 +296,11 @@ fn listen_to_socket(
                     if let Ok(event) = serde_json::from_str::<NiriEvent>(&line)
                         && let Some(captured) = event.screenshot_captured
                     {
+                        let seq = config.clipboard.next_capture_seq();
                         let cfg = Arc::clone(config);
                         let notif = notifier.cloned();
                         spawn(move || {
-                            on_screenshot(&captured.path, &cfg, notif.as_ref());
+                            on_screenshot(&captured.path, &cfg, seq, notif.as_ref());
                         });
                     }
                 }
@@ -643,6 +676,7 @@ fn build_daemon_config(
         poll_interval,
         immediate,
         notify_timeout,
+        clipboard: ClipboardState::default(),
     })
 }
 
@@ -851,6 +885,7 @@ mod tests {
             poll_interval: 0,
             immediate: false,
             notify_timeout: DEFAULT_NOTIFY_TIMEOUT_MS,
+            clipboard: ClipboardState::default(),
         });
         let active_clone = Arc::clone(&active_sockets);
         let config_clone = Arc::clone(&config);
@@ -913,5 +948,18 @@ mod tests {
         let invalid_cli = Cli::try_parse_from(["niri-screenshot-daemon", "--notify-timeout", "-2"])
             .expect("-2 should parse");
         assert!(build_daemon_config(&invalid_cli, FileConfig::default()).is_err());
+    }
+
+    #[test]
+    fn test_clipboard_state_capture_order() {
+        let state = ClipboardState::default();
+        let seq1 = state.next_capture_seq();
+        let seq2 = state.next_capture_seq();
+        assert!(seq2 > seq1);
+
+        // Newer capture completes first and updates the clipboard.
+        assert!(state.run_if_latest(seq2, || true));
+        // Older, slower capture must not overwrite the newer clipboard entry.
+        assert!(!state.run_if_latest(seq1, || { panic!("stale capture should not run copy_fn") }));
     }
 }

@@ -165,7 +165,7 @@ extra_sockets = [
 
 ## Satty Invocation Details
 
-When a screenshot event is detected, Satty is invoked with:
+By default, clicking the screenshot notification launches Satty (if `--immediate` / `immediate = true` is set, or if sending the D-Bus notification fails, Satty launches immediately upon capture). Satty is invoked with:
 
 ```bash
 satty \
