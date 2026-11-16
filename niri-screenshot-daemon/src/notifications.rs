@@ -250,7 +250,10 @@ impl Notifier {
         } else {
             "Saved to disk"
         };
-        let body = format!("{filename}\n{status_note} — click to annotate");
+        let body = format!(
+            "{}\n{status_note} — click to annotate",
+            escape_markup(filename)
+        );
 
         let hints = HashMap::from([
             ("image-path", Value::from(file_uri.as_str())),
@@ -299,6 +302,19 @@ impl Notifier {
     }
 }
 
+fn escape_markup(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
 pub(crate) fn path_to_file_uri(path: &Path) -> String {
     let raw = path.to_string_lossy();
     let mut uri = String::with_capacity("file://".len() + raw.len());
@@ -316,6 +332,12 @@ pub(crate) fn path_to_file_uri(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_escape_markup() {
+        assert_eq!(escape_markup("Q&A <test>.png"), "Q&amp;A &lt;test&gt;.png");
+        assert_eq!(escape_markup("plain.png"), "plain.png");
+    }
 
     #[test]
     fn test_path_to_file_uri_encoding() {
